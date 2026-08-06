@@ -245,8 +245,9 @@ body.scanning #rvideoWrap {
   display:flex; align-items:center; justify-content:center;
 }
 body.scanning video { max-height:none; width:100%; height:100%; object-fit:cover; }
-body.scanning #panelReceive section.camera {
-  order:-1; flex:0 0 auto; margin:0 0 10px; width:100%;
+body.scanning #panelReceive section.camera { display:none; }
+body.scanning #panelReceive.showcfg section.camera {
+  display:block; order:-1; flex:0 0 auto; margin:0 0 10px; width:100%;
 }
 body.scanning #panelReceive section.camera h2,
 body.scanning #panelReceive section.camera .note { display:none; }
@@ -3054,6 +3055,46 @@ function makeQR(bytes, ecc){
   }
   throw new Error("Frame too large for this error-correction level. Lower the frame size.");
 }
+/* Auto frame size. A grid splits the same screen between g*g codes, so a fixed
+   frame size makes every module g times smaller and the camera can no longer
+   resolve the code. As long as the user has not picked a frame size by hand,
+   silently choose the largest size that keeps modules readable at the current
+   grid (measured against this screen). The select itself is moved to the pick
+   so what you see is what is streamed. */
+const BYTE_PRESETS=[180,320,500,800,1100,1500,2000,2500];
+const _verCache={};
+function qrModulesFor(bytes,ecc){
+  const key=ecc+":"+bytes;
+  if(_verCache[key]) return _verCache[key];
+  let s=""; for(let i=0;i<bytes;i++) s+="x";
+  let v=0;
+  for(v=1;v<=40;v++){ try{ const q=qrcode(v,ecc); q.addData(s,"Byte"); q.make(); break; }catch(e){} }
+  const m = v>40 ? 1000 : 21+4*(v-1);
+  _verCache[key]=m; return m;
+}
+function autoFrameBytes(g,ecc){
+  const w=Math.max(240,(window.innerWidth||390)-10);
+  const target=g>=3?2.15:g===2?2.35:2.8;
+  const budget=w/target;
+  let pick=BYTE_PRESETS[0];
+  for(const b of BYTE_PRESETS){
+    const total=g*(qrModulesFor(b,ecc)+2*MARGIN)+(g-1)*GAP;
+    if(total<=budget) pick=b; else break;
+  }
+  return pick;
+}
+function applyAutoBytes(){
+  if(document.body.classList.contains("sending")) return;
+  const sel=$("bytes");
+  if(!sel || sel.dataset.userSet==="1") return;
+  const pick=autoFrameBytes(+$("grid").value || 1, $("ecc").value);
+  for(const o of sel.options){ if(+o.value === pick){ sel.value=String(pick); break; } }
+}
+$("bytes").addEventListener("change",()=>{ $("bytes").dataset.userSet="1"; });
+["grid","ecc"].forEach(id=>$(id).addEventListener("change", applyAutoBytes));
+window.addEventListener("resize", applyAutoBytes);
+applyAutoBytes();
+
 function rasterize(q, margin){
   const n = q.getModuleCount(), size = n + 2*margin;
   const px = new Uint32Array(size*size).fill(0xffffffff);
@@ -3090,6 +3131,7 @@ async function start(){
   try{ src = await getPayload(); }catch(e){ showMsg(e.message,"bad"); return; }
   try{ packed = await packFile(src.name, src.type, src.bytes); }catch(e){ showMsg(e.message,"bad"); return; }
 
+  applyAutoBytes();
   const frameBytes = +$("bytes").value;
   const blockLen = frameBytes - HEADER_LEN;
   const container = packed.container;
@@ -3113,6 +3155,7 @@ async function start(){
   const gen = generation;
   document.body.classList.add("sending");
   document.body.classList.remove("showcfg");
+  $("panelSend").classList.remove("showcfg");
   $("stagehint").textContent = "transmitting";
   ["bytes","file","text"].forEach(id=>$(id).disabled = true);
   [...$("modeTabs").children].forEach(b=>b.disabled = true);
@@ -3126,6 +3169,7 @@ async function start(){
   const queue = [];
   function redraw(){
     if(!lastImg) return;
+    if(staging.width !== lastImg.width){ staging.width = lastImg.width; staging.height = lastImg.height; }
     sctx.putImageData(lastImg, 0, 0);
     ctx.imageSmoothingEnabled = false;
     ctx.drawImage(staging, 0, 0, canvas.width, canvas.height);
@@ -3212,7 +3256,7 @@ function buildSenderWorkerSource(){
     '    for(let y=0;y<mods;y++){ const row=(oy+y+MARGIN)*total+ox+MARGIN;',
     '      for(let x=0;x<mods;x++) if(q.isDark(y,x)) px[row+x]=0xff000000; }',
     '  }',
-    '  self.postMessage({type:"sheet",seq:d.seq,total:total,mods:mods,buf:px.buffer},[px.buffer]);',
+    '  self.postMessage({type:"sheet",seq:d.seq,total:total,mods:mods,g:grid,buf:px.buffer},[px.buffer]);',
     '};'
   ].join("\n");
 }
@@ -3297,10 +3341,14 @@ function buildSenderWorkerSource(){
         if(d.type !== "sheet") return;
         pending--;
         if(gen !== generation) return;
-        if(!version){ version = 1; modules = d.mods; cellModules = d.mods + 2*MARGIN;
-                      sheet = d.total; sizeCanvas(); showPlan(); }
-        if(queue.length < QUEUE_MAX)
-          queue.push(new ImageData(new Uint8ClampedArray(d.buf), d.total, d.total));
+        const img = new ImageData(new Uint8ClampedArray(d.buf), d.total, d.total);
+        /* a sheet still in flight from before a live grid flip must not size
+           the stage (or it would be drawn clipped); it is harmless to show */
+        if(!version && (d.g === undefined || d.g === grid)){
+          version = 1; modules = d.mods; cellModules = d.mods + 2*MARGIN;
+          sheet = d.total; sizeCanvas(); showPlan();
+        }
+        if(queue.length < QUEUE_MAX) queue.push(img);
         feed(w);
       };
       w.onerror = () => { pending = Math.max(0, pending-1); };
@@ -3341,6 +3389,7 @@ function buildSenderWorkerSource(){
     if(now >= nextAt){
       const img = queue.shift();
       if(img){
+        if(staging.width !== img.width){ staging.width = img.width; staging.height = img.height; }
         lastImg = img;
         sctx.putImageData(img, 0, 0);
         ctx.imageSmoothingEnabled = false;
@@ -3395,6 +3444,7 @@ function stop(){
   generation++;
   if(typeof window.__killGen === "function"){ window.__killGen(); window.__killGen = null; }
   document.body.classList.remove("sending","showcfg");
+  $("panelSend").classList.remove("showcfg");
   $("stagehint").textContent = "idle";
   ["bytes","file","text"].forEach(id=>$(id).disabled = false);
   [...$("modeTabs").children].forEach(b=>b.disabled = false);
@@ -3416,7 +3466,7 @@ function stop(){
 $("start").addEventListener("click", start);
 $("stop").addEventListener("click", stop);
 $("cfg").addEventListener("click", ()=>{
-  const on = document.body.classList.toggle("showcfg");
+  const on = $("panelSend").classList.toggle("showcfg");
   $("cfg").textContent = on ? "Hide settings" : "Settings";
   requestAnimationFrame(()=>{ if(typeof window.__resize === "function") window.__resize(); });
 });
@@ -3656,7 +3706,7 @@ function addWorker(mod){
     try{ w.postMessage({ type:"init", mod }); }
     catch(e){ wErr++; try{ w.terminate(); }catch(_){} resolve(false); return; }
     pool.push(w); busy.push(false); slotTimer.push(0);
-    setTimeout(()=>done(false), 10000);
+    setTimeout(()=>done(false), 4000);
   });
 }
 /* Fallback that uses no workers at all. Slower, but it only depends on plain
@@ -3849,7 +3899,11 @@ async function start(){
     running = true;
     document.body.classList.add("scanning");
     document.body.classList.remove("showcfg");
+    $("panelReceive").classList.remove("showcfg");
     grabs=submits=decodesDone=stalled=qrHits=codesSeen=goodScreens=0; diagAt=0; gridAt=0; gridHint=0;
+    capPath = (typeof VideoFrame !== "undefined" && !videoOnly()) ? "track" : "video";
+    capSwitches=0; blackStreak=0; blackReported=false; copyToFails=0; copyToBroken=false; grabBusy=false;
+    lastFrameTime = -1;
     lastProgressAt=0; lastFramesNew=-1;
     startedAt = 0; rateWin = [];
     const track = stream.getVideoTracks()[0];
@@ -3880,7 +3934,7 @@ function stop(opts){
   $("rvideo").srcObject = null;
   $("rbadge").textContent = "searching";
   $("rreticle").classList.remove("lock");
-  if(!keepDecoder) document.body.classList.remove("scanning","showcfg");
+  if(!keepDecoder){ document.body.classList.remove("scanning","showcfg"); $("panelReceive").classList.remove("showcfg"); }
   killWorkers(); backend = "none"; mainBusy = false;
   setStage("idle");
   if(wakeLock){ try{ wakeLock.release(); }catch(e){} wakeLock=null; }
@@ -3896,6 +3950,7 @@ function resetTransfer(){
   $("rsRate").textContent="0"; $("rsSpeed").textContent="0 B/s"; $("rsDup").textContent="0";
   $("rbadge").textContent="searching"; $("rreticle").classList.remove("lock");
   document.body.classList.remove("hasdata","hasresult","showcfg");
+  $("panelReceive").classList.remove("showcfg");
   showMsg(""); setStatus(running ? "Reset. Waiting for frames." : "Reset. Press Start camera.");
 }
 
@@ -4022,25 +4077,65 @@ function fitReticle(){
 let lastFrameTime = -1;
 
 
-function grab(force){
-  const v = $("rvideo");
-  if(!v.videoWidth || !v.videoHeight) return;
-  if(backend === "workers"){ if(busy.indexOf(false) === -1) return; }
-  else if(backend === "main"){ if(mainBusy) return; }
-  else return;                                   // decoder not up yet
-  if(!force){
-    const t = v.currentTime;
-    if(t === lastFrameTime) return;
-    lastFrameTime = t;
+/* Two ways to read camera frames:
+   "track" = a VideoFrame taken from the element and copied out with copyTo(),
+             so neither the video paint nor a canvas readback is involved.
+   "video" = drawImage(video) into a canvas, then getImageData (classic path).
+   Chrome on Android has a long history of the "video" path handing black or
+   frozen frames to JavaScript on some devices while the visible preview is
+   fine - which is exactly why this page decoded in Firefox but sat silent in
+   Chrome. We watch the actual pixels and flip paths automatically. */
+let capPath = "video", capSwitches = 0, blackStreak = 0, blackReported = false;
+let copyToFails = 0, copyToBroken = false, grabBusy = false;
+function videoOnly(){ return /(^|[#&-])video(?=[#&-]|$)/.test(location.hash || ""); }
+function setCapPath(next){
+  if(next === capPath) return;
+  if(next === "track" && typeof VideoFrame === "undefined") return;
+  capPath = next;
+}
+function inspectBlack(px){
+  if(qrHits > 0 || !running) return;      // decoding works: stop watching
+  let sum = 0, n = 0;
+  for(let i=0; i+2 < px.length; i += 4092){ sum += px[i]+px[i+1]+px[i+2]; n++; }
+  const mean = n ? sum/(n*3) : 255;
+  if(mean < 6) blackStreak++; else blackStreak = 0;
+  if(blackStreak === 8){
+    if(capSwitches < 1 && !videoOnly()){
+      capSwitches++;
+      setCapPath(capPath === "track" ? "video" : "track");
+      blackStreak = 0;
+    } else if(!blackReported){
+      blackReported = true;
+      showMsg("The camera frames reaching this browser are completely black. "
+            + "On some phones Chrome cannot hand the camera image to a web page "
+            + "while Firefox can. Try Firefox, or an updated Chrome.", "bad");
+    }
   }
-  const vw = v.videoWidth, vh = v.videoHeight;
-  const src = Math.floor(Math.min(vw, vh) * 0.82);
-  const sx = ((vw - src) / 2) | 0, sy = ((vh - src) / 2) | 0;
-  const side = Math.min(WORK, src);
-  if(cnv.width!==side || cnv.height!==side){ cnv.width=side; cnv.height=side; }
-  cctx.drawImage(v, sx, sy, src, src, 0, 0, side, side);
-  let img;
-  try{ img = cctx.getImageData(0,0,side,side); }catch(e){ return; }
+}
+async function grabFromTrack(v, sx, sy, src, side){
+  let vf = null;
+  try{ vf = new VideoFrame(v); }
+  catch(e){ copyToFails++; if(copyToFails >= 2){ copyToBroken = true; setCapPath("video"); } return null; }
+  try{
+    if(!copyToBroken && side === src){
+      /* native-resolution square straight out of the frame, no canvas at all */
+      const rect = { x:sx, y:sy, width:src, height:src };
+      const size = vf.allocationSize({ rect, format:"RGBA" });
+      const buf = new ArrayBuffer(size);
+      await vf.copyTo(buf, { rect, format:"RGBA" });
+      return new ImageData(new Uint8ClampedArray(buf), side, side);
+    }
+    if(cnv.width!==side || cnv.height!==side){ cnv.width=side; cnv.height=side; }
+    cctx.drawImage(vf, sx, sy, src, src, 0, 0, side, side);
+    return cctx.getImageData(0, 0, side, side);
+  }catch(e){
+    copyToFails++;
+    if(copyToFails >= 2){ copyToBroken = true; setCapPath("video"); }
+    return null;
+  }finally{ try{ if(vf) vf.close(); }catch(e){} }
+}
+function consume(img, side){
+  inspectBlack(img.data);
   grabs++;
   if(backend === "workers"){
     const buf = img.data.buffer;
@@ -4055,6 +4150,36 @@ function grab(force){
       }
     }).catch(()=>{ mainBusy = false; decodesDone++; });
   }
+}
+
+function grab(force){
+  const v = $("rvideo");
+  if(!v.videoWidth || !v.videoHeight) return;
+  if(backend === "workers"){ if(busy.indexOf(false) === -1) return; }
+  else if(backend === "main"){ if(mainBusy) return; }
+  else return;                                   // decoder not up yet
+  if(grabBusy) return;
+  if(!force){
+    const t = v.currentTime;
+    if(t === lastFrameTime) return;
+    lastFrameTime = t;
+  }
+  const vw = v.videoWidth, vh = v.videoHeight;
+  const src = Math.floor(Math.min(vw, vh) * 0.82);
+  const sx = ((vw - src) / 2) | 0, sy = ((vh - src) / 2) | 0;
+  const side = Math.min(WORK, src);
+  if(capPath === "track"){
+    grabBusy = true;
+    grabFromTrack(v, sx, sy, src, side)
+      .then(img=>{ grabBusy = false; if(img) consume(img, side); })
+      .catch(()=>{ grabBusy = false; });
+    return;
+  }
+  if(cnv.width!==side || cnv.height!==side){ cnv.width=side; cnv.height=side; }
+  cctx.drawImage(v, sx, sy, src, src, 0, 0, side, side);
+  let img;
+  try{ img = cctx.getImageData(0,0,side,side); }catch(e){ return; }
+  consume(img, side);
 }
 
 function onDecoded(bytes){
@@ -4167,7 +4292,7 @@ $("rstart").addEventListener("click", start);
 $("rstop").addEventListener("click", stop);
 $("rreset").addEventListener("click", resetTransfer);
 $("rcfg").addEventListener("click", ()=>{
-  const on = document.body.classList.toggle("showcfg");
+  const on = $("panelReceive").classList.toggle("showcfg");
   $("rcfg").textContent = on ? "Hide settings" : "Settings";
 });
 /* Every control is live. Changing the camera or the quality reopens the
@@ -4235,12 +4360,14 @@ window.__receiverStopAll = function(){ try{ stop(); }catch(e){} try{ resetTransf
   var sendBtn = document.getElementById("modeSend");
   var recvBtn = document.getElementById("modeReceive");
   var current = "send";
+  var vidFlag = /receive[#&-]video(?![\w-])/.test(location.hash) ? "-video" : "";
   function apply(m){
     current = m;
     document.body.classList.toggle("mode-send", m==="send");
     document.body.classList.toggle("mode-receive", m==="receive");
     sendBtn.classList.toggle("sel", m==="send");
     recvBtn.classList.toggle("sel", m==="receive");
+    try{ history.replaceState(null, "", "#" + m + (m==="receive" ? vidFlag : "")); }catch(e){}
   }
   sendBtn.addEventListener("click", function(){
     if(current==="send") return;
@@ -4252,9 +4379,15 @@ window.__receiverStopAll = function(){ try{ stop(); }catch(e){} try{ resetTransf
     if(typeof window.__senderStop === "function") window.__senderStop();
     apply("receive");
   });
-  apply("send");
+  window.addEventListener("hashchange", function(){
+    var m = /receive/.test(location.hash) ? "receive" : "send";
+    if(m === current) return;
+    if(typeof window.__receiverStopAll === "function") window.__receiverStopAll();
+    if(typeof window.__senderStop === "function") window.__senderStop();
+    apply(m);
+  });
+  apply(/receive/.test(location.hash) ? "receive" : "send");
 })();
 </script>
-
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a2702a8aec01c9de',t:'MTc4NjA0MTU4Ng=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a270b7a0e88a23c9',t:'MTc4NjA0NzM2NQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
