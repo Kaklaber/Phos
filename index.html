@@ -3073,8 +3073,10 @@ function qrModulesFor(bytes,ecc){
   _verCache[key]=m; return m;
 }
 function autoFrameBytes(g,ecc){
-  const w=Math.max(240,(window.innerWidth||390)-10);
-  const target=g>=3?2.15:g===2?2.35:2.8;
+  /* stage geometry while sending: panel padding 16*2, topbar 52, sub bar,
+     controls, meter and readout -- measured ~204 px of chrome on desktop */
+  const w=Math.max(240, Math.min((window.innerWidth||390)-32, (window.innerHeight||700)-204));
+  const target=g>=3?2.15:g===2?2.35:2.55;
   const budget=w/target;
   let pick=BYTE_PRESETS[0];
   for(const b of BYTE_PRESETS){
@@ -3193,15 +3195,14 @@ async function start(){
     let avail = Math.min(box.width || 320, box.height || 320);
     if(!isFinite(avail) || avail < 80) avail = 320;
     const budget = Math.max(120, displayPx > 0 ? Math.min(displayPx, avail) : avail);
-    /* Whole device pixels per module, and never more bitmap than fits: if the
-       canvas is bigger than the element the browser resamples it DOWN, which
-       blurs the module edges and is exactly what a QR decoder cannot cope
-       with. Floor, then size the element to the bitmap so one canvas pixel is
-       one screen pixel. */
-    scale = Math.max(1, Math.floor((budget * dpr) / total));
+    /* Bitmap at a whole number of device pixels per module (crisp), but the
+       element stretched to the full box with nearest-neighbour: modules end
+       up 2 px on this row and 3 on the next, which no decoder cares about,
+       and the code finally uses ALL the glass instead of a snapped-down step. */
+    const css = Math.floor(budget);
+    scale = Math.max(1, Math.round((css * dpr) / total));
     staging.width = total; staging.height = total;
     canvas.width = total*scale; canvas.height = total*scale;
-    const css = (total*scale)/dpr;
     canvas.style.width = css+"px";
     canvas.style.height = css+"px";
     ctx.imageSmoothingEnabled = false;
@@ -4356,6 +4357,7 @@ window.__receiverStopAll = function(){ try{ stop(); }catch(e){} try{ resetTransf
 </script>
 
 <script>
+window.__phosBuild = "2026-08-06.4-auto-render";
 (function(){
   var sendBtn = document.getElementById("modeSend");
   var recvBtn = document.getElementById("modeReceive");
@@ -4389,5 +4391,5 @@ window.__receiverStopAll = function(){ try{ stop(); }catch(e){} try{ resetTransf
   apply(/receive/.test(location.hash) ? "receive" : "send");
 })();
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a270b7a0e88a23c9',t:'MTc4NjA0NzM2NQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a270d77b0b81e451',t:'MTc4NjA0ODY2OQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
