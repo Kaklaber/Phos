@@ -463,6 +463,7 @@ body.scanning #panelReceive section.camera .note { display:none; }
     <ol>
       <li>Start the camera and allow permission.</li>
       <li>Point it at the sender’s code, holding steady a hand’s width away.</li>
+      <li>Wavy bands or purple tint? Pick 720p Quality, and set the sender’s screen brightness to maximum.</li>
       <li>When progress reaches 100%, press Save file.</li>
     </ol>
   </details>
@@ -3595,7 +3596,7 @@ function buildWorkerSource(){
     '  }',
     '  try{',
     '    var img = new ImageData(new Uint8ClampedArray(d.buf), d.w, d.h);',
-    '    var res = await ZXingWASM.readBarcodes(img, { formats:["QRCode"], maxNumberOfSymbols:9, tryHarder:false });',
+    '    var res = await ZXingWASM.readBarcodes(img, { formats:["QRCode"], maxNumberOfSymbols:9, tryHarder:false, tryRotate:false, tryInvert:false });',
     '    var out = [], tr = [];',
     '    for(var i=0;i<res.length;i++){',
     '      if(res[i].isValid && res[i].bytes && res[i].bytes.length){',
@@ -3726,7 +3727,7 @@ async function startMain(){
   mainPrepared = true;
 }
 async function mainDecodeOne(img){
-  const r = await ZXingWASM.readBarcodes(img, { formats:["QRCode"], maxNumberOfSymbols:9, tryHarder:false });
+  const r = await ZXingWASM.readBarcodes(img, { formats:["QRCode"], maxNumberOfSymbols:9, tryHarder:false, tryRotate:false, tryInvert:false });
   const out = [];
   for(const x of r) if(x.isValid && x.bytes && x.bytes.length) out.push(x.bytes);
   return out;
@@ -3847,8 +3848,12 @@ async function optFocus(){
     const track = stream && stream.getVideoTracks()[0];
     if(!track || !track.getCapabilities) return;
     const caps = track.getCapabilities();
-    if(caps.focusMode && caps.focusMode.includes("continuous"))
-      await withTimeout(track.applyConstraints({ advanced:[{focusMode:"continuous"}] }), 2500);
+    const adv = {};
+    if(caps.focusMode && caps.focusMode.includes("continuous")) adv.focusMode = "continuous";
+    if(caps.exposureMode && caps.exposureMode.includes("continuous")) adv.exposureMode = "continuous";
+    if(caps.whiteBalanceMode && caps.whiteBalanceMode.includes("continuous")) adv.whiteBalanceMode = "continuous";
+    if(Object.keys(adv).length)
+      await withTimeout(track.applyConstraints({ advanced:[adv] }), 2500);
   }catch(e){}
 }
 async function optWake(){
@@ -3869,12 +3874,14 @@ async function start(){
       showMsg("This browser has no camera API.","bad"); return;
     }
     setStage("opening camera");
+    if(LOWEND && $("rres").dataset.userSet!=="1") $("rres").value="720";
+    $("rres").addEventListener("change",()=>{ $("rres").dataset.userSet="1"; },{ once:true });
     const want = +$("rres").value, devId = $("rcam").value;
     const constraints = {
       audio:false,
       video: devId
-        ? { deviceId:{exact:devId}, width:{ideal:want*16/9}, height:{ideal:want}, frameRate:{ideal:30} }
-        : { facingMode:{ideal:"environment"}, width:{ideal:want*16/9}, height:{ideal:want}, frameRate:{ideal:30} }
+        ? { deviceId:{exact:devId}, width:{ideal:want*16/9}, height:{ideal:want}, frameRate:{ideal:60,min:24} }
+        : { facingMode:{ideal:"environment"}, width:{ideal:want*16/9}, height:{ideal:want}, frameRate:{ideal:60,min:24} }
     };
     try{ stream = await navigator.mediaDevices.getUserMedia(constraints); }
     catch(e){
@@ -3972,7 +3979,8 @@ const cctx = cnv.getContext("2d", { alpha:false, willReadFrequently:true });
    is the most sensitive to this (each frame allocates a fresh multi-megabyte
    buffer), so we keep it moderate: plenty for a grid cell, but not the
    1280 that re-triggered the Chrome on Android stalls. */
-const WORK = 1024;
+const LOWEND = (navigator.deviceMemory && navigator.deviceMemory <= 4) || ((navigator.hardwareConcurrency || 8) <= 4);
+const WORK = LOWEND ? 768 : 1024;
 
 
 
@@ -4391,5 +4399,5 @@ window.__phosBuild = "2026-08-06.4-auto-render";
   apply(/receive/.test(location.hash) ? "receive" : "send");
 })();
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a270d77b0b81e451',t:'MTc4NjA0ODY2OQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a270d77b0b81e451',t:'MTc4NjA0ODY2OQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a288b360dbd0d256',t:'MTc4NjI5ODg0OQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
