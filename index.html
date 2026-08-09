@@ -463,9 +463,10 @@ body.scanning #panelReceive section.camera .note { display:none; }
     <ol>
       <li>Start the camera and allow permission.</li>
       <li>Point it at the sender’s code, holding steady a hand’s width away.</li>
-      <li>Wavy bands or purple tint? Pick 720p Quality, and set the sender’s screen brightness to maximum.</li>
       <li>When progress reaches 100%, press Save file.</li>
+      <li>Wavy bands or a purple tint in the preview? Set Quality to 720p, and turn the sender’s screen brightness to maximum.</li>
     </ol>
+    <div style="font-size:11px;opacity:.55;margin-top:4px">Receiver build 2026-08-09 · v4</div>
   </details>
 </section>
 <script id="qrlib" type="text/plain">//---------------------------------------------------------------------
@@ -3666,7 +3667,7 @@ function poolSubmit(msg, transfer){
 function killWorkers(){
   pool.forEach(w=>{ try{ w.terminate(); }catch(e){} });
   slotTimer.forEach(t=>{ if(t) clearTimeout(t); });
-  pool=[]; busy=[]; slotTimer=[]; ready=0; bufPool.length = 0; imgPool.length = 0;
+  pool=[]; busy=[]; slotTimer=[]; ready=0; bufPool.length = 0;
 }
 
 /* Start ONE worker first and only add the rest once it has answered. Chrome
@@ -3872,8 +3873,13 @@ async function start(){
       showMsg("This browser has no camera API.","bad"); return;
     }
     setStage("opening camera");
-    if(LOWEND && $("rres").dataset.userSet!=="1") $("rres").value="720";
-    $("rres").addEventListener("change",()=>{ $("rres").dataset.userSet="1"; },{ once:true });
+    /* getUserMedia can stay pending forever with no error (no prompt shown,
+       driver wedged, or camera held by another app). That used to look like
+       a dead page: say so out loud instead. */
+    setTimeout(()=>{ if(starting && !stream){
+      setStage("camera not answering");
+      showMsg("The browser has not answered the camera request for 25 seconds. If no permission prompt appeared, allow the camera for this site (padlock icon), close other apps that might use the camera, then reload the page.","bad");
+    } }, 25000);
     const want = +$("rres").value, devId = $("rcam").value;
     const constraints = {
       audio:false,
@@ -3924,6 +3930,13 @@ async function start(){
     optFocus();
     optWake();
     startDecoder();
+    /* Same for the decoder chain: every failure path above shows a message,
+       but a hung wasm compile shows nothing. If it is still not up after
+       30 s, tell the user instead of watching a dead "preparing" hint. */
+    setTimeout(()=>{ if(running && backend === "none"){
+      setStage("decoder stuck");
+      showMsg("The decoder has not started after 30 seconds. Reload the page and try again; if it repeats, try Decoder threads: Single thread in the settings, or another browser.","bad");
+    } }, 30000);
   }catch(e){
     setStage("failed");
     showMsg("Could not start: " + (e && e.message || e), "bad");
@@ -3977,8 +3990,7 @@ const cctx = cnv.getContext("2d", { alpha:false, willReadFrequently:true });
    is the most sensitive to this (each frame allocates a fresh multi-megabyte
    buffer), so we keep it moderate: plenty for a grid cell, but not the
    1280 that re-triggered the Chrome on Android stalls. */
-const LOWEND = (navigator.deviceMemory && navigator.deviceMemory <= 4) || ((navigator.hardwareConcurrency || 8) <= 4);
-const WORK = LOWEND ? 768 : 1024;
+const WORK = 1024;
 
 
 
@@ -4120,17 +4132,12 @@ function inspectBlack(px){
   }
 }
 /* Reusable pixel buffers. Every grab needs a multi-megabyte RGBA buffer;
-   allocating a fresh one per frame makes tens to hundreds of MB/s of garbage,
-   which is the known "Chrome on Android dies seconds after the camera opens"
-   pattern. Instead the worker transfers each buffer straight back with its
-   answer (d.buf), and the next grab reuses it. Steady state: zero allocation.
-   At most 1 grabbing + one per worker slot can be in flight, so 5 covers the
-   worst case; beyond that we simply allocate (warmup or a size change). */
-/* Between a response being decoded and its pixels being re-read from the
-   canvas, ImageData objects from getImageData would otherwise stack up in
-   old-space between GC cycles; a tiny reuse list caps that too. */
-const imgPool = [];
-const IMG_POOL_MAX = 3;
+   allocating a fresh one per frame makes tens of MB/s of garbage, the known
+   "Chrome on Android dies seconds after the camera opens" pattern noted
+   above. Instead the decode worker transfers each buffer straight back with
+   its answer (d.buf), and the next grab reuses it via grabBuf. In-flight is
+   at most 1 grabbing + one per worker slot, so the pool caps at 5 and steady
+   state allocates nothing. */
 const bufPool = [];
 const BUF_POOL_MAX = 5;
 function grabBuf(size){
@@ -4141,7 +4148,7 @@ function grabBuf(size){
 function freeBuf(buf){
   if(buf && bufPool.length < BUF_POOL_MAX) bufPool.push(buf);
 }
-async function grabFromTrack(v, sx, sy, src, side, recycled){
+async function grabFromTrack(v, sx, sy, src, side){
   let vf = null;
   try{ vf = new VideoFrame(v); }
   catch(e){ copyToFails++; if(copyToFails >= 2){ copyToBroken = true; setCapPath("video"); } return null; }
@@ -4159,24 +4166,12 @@ async function grabFromTrack(v, sx, sy, src, side, recycled){
     }
     if(cnv.width!==side || cnv.height!==side){ cnv.width=side; cnv.height=side; }
     cctx.drawImage(vf, sx, sy, src, src, 0, 0, side, side);
-    if(recycled){
-      try{ cctx.putImageData(recycled, 0, 0); return cctx.getImageData(0, 0, side, side); }catch(e){}
-    }
     return cctx.getImageData(0, 0, side, side);
   }catch(e){
     copyToFails++;
     if(copyToFails >= 2){ copyToBroken = true; setCapPath("video"); }
     return null;
   }finally{ try{ if(vf) vf.close(); }catch(e){} }
-}
-/* Recycle a same-sized ImageData that is about to be submitted whole (its
-   buffer is transferred to the worker, never copied). Both capture paths can
-   produce one per frame; pooling them keeps each frame's footprint at one
-   buffer instead of one kept + one new. */
-function recycleImg(img, side){
-  if(!img || img.width !== side || img.height !== side) return;
-  const buf = img.data ? img.data.buffer : null;
-  if(buf && buf.byteLength === sideBytes) freeBuf(buf);
 }
 function consume(img, side){
   inspectBlack(img.data);
@@ -4211,27 +4206,18 @@ function grab(force){
   const vw = v.videoWidth, vh = v.videoHeight;
   const src = Math.floor(Math.min(vw, vh) * 0.82);
   const sx = ((vw - src) / 2) | 0, sy = ((vh - src) / 2) | 0;
-  const side = Math.min(WORK, src), sideBytes = side * side * 4;
+  const side = Math.min(WORK, src);
   if(capPath === "track"){
     grabBusy = true;
-    const imgTrack = imgPool.length ? imgPool.pop() : null;
-    grabFromTrack(v, sx, sy, src, side, imgTrack)
-      .then(img=>{
-        grabBusy = false;
-        if(img){ recycleImg(imgTrack, side); consume(img, side); }
-        else if(imgTrack) imgPool.push(imgTrack);
-      })
-      .catch(()=>{
-        grabBusy = false;
-        if(imgTrack) imgPool.push(imgTrack);
-      });
+    grabFromTrack(v, sx, sy, src, side)
+      .then(img=>{ grabBusy = false; if(img) consume(img, side); })
+      .catch(()=>{ grabBusy = false; });
     return;
   }
   if(cnv.width!==side || cnv.height!==side){ cnv.width=side; cnv.height=side; }
   cctx.drawImage(v, sx, sy, src, src, 0, 0, side, side);
-  let img = imgPool.length ? imgPool.pop() : null;
-  if(img){ try{ cctx.putImageData(img, 0, 0); img = cctx.getImageData(0, 0, side, side); }catch(e){ img = null; } }
-  if(!img){ try{ img = cctx.getImageData(0,0,side,side); }catch(e){ return; } }
+  let img;
+  try{ img = cctx.getImageData(0,0,side,side); }catch(e){ return; }
   consume(img, side);
 }
 
@@ -4443,5 +4429,5 @@ window.__phosBuild = "2026-08-06.4-auto-render";
   apply(/receive/.test(location.hash) ? "receive" : "send");
 })();
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a270d77b0b81e451',t:'MTc4NjA0ODY2OQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a288ef51baaf5d65',t:'MTc4NjMwMTMwNA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a270d77b0b81e451',t:'MTc4NjA0ODY2OQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a289147c19ab19a0',t:'MTc4NjMwMjgyNg=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
