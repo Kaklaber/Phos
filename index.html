@@ -44,7 +44,7 @@ input[type=file], textarea, select {
   background:#ffffff; color:#444;
   border:1px solid #b9b9b9;
 }
-.mode-switch button + button { margin-left:-1px; }
+.mode-switch button + button { margin-left:8px; }
 .mode-switch button.sel { background:#24457a; color:#fff; border-color:#24457a; }
 
 /* ---- page shell ---- */
@@ -322,13 +322,14 @@ body.scanning #panelReceive section.camera .note { display:none; }
             <option value="1500" selected>1500 B</option>
             <option value="2000">2000 B</option>
             <option value="2500">2500 B</option>
+            <option value="2900">2900 B</option>
           </select>
         </div>
         <div>
           <label for="grid">Codes / screen</label>
           <select id="grid">
-            <option value="1">1</option>
-            <option value="2" selected>2 x 2</option>
+            <option value="1" selected>1</option>
+            <option value="2">2 x 2</option>
             <option value="3">3 x 3</option>
           </select>
         </div>
@@ -3066,7 +3067,7 @@ function makeQR(bytes, ecc){
    silently choose the largest size that keeps modules readable at the current
    grid (measured against this screen). The select itself is moved to the pick
    so what you see is what is streamed. */
-const BYTE_PRESETS=[180,320,500,800,1100,1500,2000,2500];
+const BYTE_PRESETS=[180,320,500,800,1100,1500,2000,2500,2900];
 const _verCache={};
 function qrModulesFor(bytes,ecc){
   const key=ecc+":"+bytes;
@@ -3990,7 +3991,7 @@ async function start(){
     document.body.classList.remove("showcfg");
     $("panelReceive").classList.remove("showcfg");
     grabs=submits=decodesDone=stalled=qrHits=codesSeen=goodScreens=0; diagAt=0; gridAt=0; gridHint=0;
-    liveAt = performance.now();
+    liveAt = performance.now(); lastGrabAt = 0;
     capPath = (typeof VideoFrame !== "undefined" && !videoOnly()) ? "track" : "video";
     capSwitches=0; blackStreak=0; blackReported=false; copyToFails=0; copyToBroken=false; grabBusy=false;
     lastFrameTime = -1;
@@ -3998,6 +3999,11 @@ async function start(){
     startedAt = 0; rateWin = [];
     const track = stream.getVideoTracks()[0];
     const st = track && track.getSettings ? track.getSettings() : {};
+    if(track) track.onended = ()=>{
+      if(!running) return;
+      showMsg("The camera connection was lost. Reconnecting (progress is kept)...", "warn");
+      restartCamera();
+    };
     if($("rturbo") && $("rturbo").checked && st.frameRate && st.frameRate < 50)
       showMsg("Asked the camera for 60 fps but it delivers " + Math.round(st.frameRate)
             + ". Untick 60 fps or lower the Quality.", "warn");
@@ -4065,12 +4071,13 @@ const cctx = cnv.getContext("2d", { alpha:false, willReadFrequently:true });
    is the most sensitive to this (each frame allocates a fresh multi-megabyte
    buffer), so we keep it moderate: plenty for a grid cell, but not the
    1280 that re-triggered the Chrome on Android stalls. */
-const WORK = 1024;
+const WORK = (navigator.hardwareConcurrency || 4) <= 4 ? 768 : 1024;
 
 
 
 let diagAt = 0, retAt = 0, gridAt = 0, gridHint = 0;
 let liveAt = 0, lastDropAt = 0, autoDrops = 0;
+let lastGrabAt = 0, lastCamRestartAt = 0;
 let lastProgressAt = 0, lastFramesNew = -1;
 function diagTick(){
   const now = performance.now();
@@ -4078,6 +4085,13 @@ function diagTick(){
   if(running && liveAt && now - liveAt > 25000 && grabs > 0){
     const delivered = grabs / ((now - liveAt) / 1000);
     if(delivered < 10) autoQualityDown();
+  }
+  if(running && backend !== "none" && lastGrabAt
+     && (document.visibilityState || "visible") === "visible"
+     && now - lastGrabAt > 6000 && now - lastCamRestartAt > 15000){
+    lastCamRestartAt = now;
+    showMsg("Camera frames stopped arriving. Restarting the camera (progress is kept).", "warn");
+    restartCamera();
   }
   if(decoder && !decoder.isComplete){
     /* Detect a transfer that starts and then dies, which is much more useful
@@ -4236,6 +4250,7 @@ async function grabFromTrack(v, sx, sy, src, side){
 function consume(img, side){
   inspectBlack(img.data);
   grabs++;
+  lastGrabAt = performance.now();
   if(backend === "workers"){
     const buf = img.data.buffer;
     if(poolSubmit({ id: nextId++, buf, w: side, h: side }, [buf])) submits++;
@@ -4489,5 +4504,5 @@ window.__phosBuild = "2026-08-06.4-auto-render";
   apply(/receive/.test(location.hash) ? "receive" : "send");
 })();
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a270d77b0b81e451',t:'MTc4NjA0ODY2OQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a28b24ba0aad367e',t:'MTc4NjMyNDQ2Mw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a270d77b0b81e451',t:'MTc4NjA0ODY2OQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a28b47dbabebd9d6',t:'MTc4NjMyNTkwMg=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
