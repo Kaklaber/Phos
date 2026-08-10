@@ -394,6 +394,7 @@ body.scanning #panelReceive section.camera .note { display:none; }
         <div>
           <label for="rres">Quality</label>
           <select id="rres">
+            <option value="480">480p</option>
             <option value="720">720p</option>
             <option value="1080" selected>1080p</option>
             <option value="1440">1440p</option>
@@ -417,6 +418,10 @@ body.scanning #panelReceive section.camera .note { display:none; }
             <option value="2">2</option>
             <option value="3">3</option>
           </select>
+        </div>
+        <div class="wide">
+          <label style="display:flex;gap:7px;align-items:center;margin-top:4px"><input type="checkbox" id="rautoq" checked> Lower the quality automatically when the camera is too slow</label>
+          <label style="display:flex;gap:7px;align-items:center"><input type="checkbox" id="rturbo"> Ask the camera for 60 fps (faster where the sensor allows it)</label>
         </div>
       </div>
       <p class="note">1080p balances detail and speed. Changes apply while the camera runs. Needs https:// or localhost.</p>
@@ -3538,13 +3543,12 @@ function fmtBytes(n){
   return (n/1024/1024).toFixed(2) + " MB";
 }
 function showMsg(t,k){
-  if(t) __phdiag("msg[" + (k||"info") + "]: " + t);
   const m=$("rmsg");
   if(!t){ m.className="alert"; m.textContent=""; return; }
   m.className="alert "+k; m.textContent=t;
 }
-function setStatus(t){ $("rstatus").textContent = t; __phdiag("status: " + t); }
-function setStage(t){ $("rstagehint").textContent = t; __phdiag("stage: " + t); }
+function setStatus(t){ $("rstatus").textContent = t; }
+function setStage(t){ $("rstagehint").textContent = t; }
 function withTimeout(p, ms){
   return Promise.race([ Promise.resolve(p), new Promise(r=>setTimeout(()=>r(undefined), ms)) ]);
 }
@@ -3741,8 +3745,6 @@ function backendNote(){
 }
 async function startDecoder(){
   if(backend !== "none") return;
-  __phdiag("startDecoder() entered");
-  setTimeout(function(){ if(backend === "none") __phdiag("WATCHDOG: decoder still not ready 12s after start"); }, 12000);
   const sel = $("rworkers").value;
   /* Chrome on Android struggles to run many WASM decoders next to a live
      camera (see the note on startWorkers). Cap it: even a single healthy
@@ -3784,7 +3786,7 @@ async function startDecoder(){
     showMsg("The decoder could not start in this browser: " + (e.message||e),"bad");
   }
 }
-function afterBackend(){ __phdiag("decoder ready -> " + backendNote());
+function afterBackend(){
   if(!decoder) setStatus("Ready, using the " + backendNote() + ". Point the camera at the sender's code.");
 }
 
@@ -3859,12 +3861,92 @@ async function optWake(){
   catch(e){}
 }
 
+/* getUserMedia can hang forever on some Android browsers - the permission
+   prompt never appears and the promise never settles - and the starting
+   latch then swallows every later tap. Race the call against a timeout and
+   stop any stream that arrives after we already gave up. */
+class GumTimeoutError extends Error{
+  constructor(){ super("camera request timed out"); this.name = "GumTimeoutError"; }
+}
+async function askCam(c){
+  let settled = null, timed = false;
+  const gum = navigator.mediaDevices.getUserMedia(c).then(st=>{ settled = st; return st; });
+  const to = new Promise((_, rej)=> setTimeout(()=>{ timed = true; rej(new GumTimeoutError()); }, 12000));
+  try{ return await Promise.race([gum, to]); }
+  finally{
+    if(timed) Promise.resolve(settled || gum).then(st=>{
+      if(st && st.getTracks) st.getTracks().forEach(t=>t.stop());
+    }, ()=>{});
+  }
+}
+/* 30 fps by default; 60 only when the user asks for it - some sensors expose
+   60 fps only at 720p and below, and some browsers crash on it, so it is a
+   deliberate, reversible toggle rather than the default. */
+function wantFps(){
+  return ($("rturbo") && $("rturbo").checked) ? { ideal:60 } : { ideal:30 };
+}
+/* Weak sensor + PWM room light = purple waves rolling through the picture
+   (and through the QR modules, which is why it also wrecks the speed).
+   Those lights flicker at twice the mains frequency, so an exposure time
+   that is a whole number of 10 ms units (50 Hz mains) always covers whole
+   flicker cycles and the banding disappears. Probe capabilities, apply, and
+   undo it again if the fixed exposure clips the scene bright or dark. */
+async function antiFlicker(track){
+  try{
+    if(typeof ImageCapture === "undefined") return;
+    const ic = new ImageCapture(track);
+    const pc = await withTimeout(ic.getPhotoCapabilities(), 2000);
+    if(!pc || pc.exposureMode !== "manual" || !pc.exposureTime) return;
+    const r = pc.exposureTime;
+    const step = r.step || 1;
+    const t = Math.round(Math.min(r.max, Math.max(r.min, 10000)) / step) * step;
+    await withTimeout(ic.setOptions({ exposureMode:"manual", exposureTime:t }), 2000);
+    setTimeout(()=>{
+      try{
+        if(!running) return;
+        const v = $("rvideo");
+        if(!v || !v.videoWidth) return;
+        const c = document.createElement("canvas");
+        c.width = c.height = 48;
+        const x = c.getContext("2d", { willReadFrequently:true });
+        x.drawImage(v, 0, 0, 48, 48);
+        const d = x.getImageData(0, 0, 48, 48).data;
+        let sum = 0;
+        for(let i = 0; i < d.length; i += 4) sum += d[i] + d[i+1] + d[i+2];
+        const mean = sum / (d.length / 4 * 3);
+        if(mean > 246 || mean < 8)
+          Promise.resolve(track.applyConstraints({ advanced:[{ exposureMode:"continuous" }] })).catch(()=>{});
+      }catch(e){}
+    }, 1500);
+  }catch(e){}
+}
+/* A sensor that will only deliver ~8 fps at 1080p caps every transfer that
+   runs through it, and no amount of waiting changes that. Stepping down a
+   resolution usually multiplies the delivery rate several times over, so do
+   it automatically - rarely, visibly, and at most twice per page load. */
+function autoQualityDown(){
+  const sel = $("rres");
+  if(!sel) return false;
+  const tgl = $("rautoq");
+  if(tgl && !tgl.checked) return false;
+  if(autoDrops >= 2 || !liveAt) return false;
+  const now = performance.now();
+  if(now - liveAt < 25000 || now - lastDropAt < 25000) return false;
+  const vals = Array.from(sel.options).map(o=>+o.value).sort((a,b)=>b-a);
+  const lower = vals.find(v=>v < +sel.value);
+  if(lower === undefined) return false;
+  autoDrops++; lastDropAt = now;
+  const from = sel.value;
+  sel.value = String(lower);
+  showMsg("The camera is too slow at " + from + "p for a good speed - switched to "
+        + lower + "p. Untick \"Lower the quality automatically\" in Settings to stop this.", "warn");
+  restartCamera();
+  return true;
+}
 async function start(){
   if(starting || running) return;
   starting = true;
   showMsg("");
-  __phdiag("start() entered");
-  setTimeout(function(){ if(starting && !stream) __phdiag("WATCHDOG: camera request still unanswered 12s after tap (hung getUserMedia)"); }, 12000);
   try{
     if(!window.isSecureContext){
       showMsg("The camera needs a secure context. Open this page over https:// or from localhost.","bad");
@@ -3878,23 +3960,20 @@ async function start(){
     const constraints = {
       audio:false,
       video: devId
-        ? { deviceId:{exact:devId}, width:{ideal:want*16/9}, height:{ideal:want}, frameRate:{ideal:30} }
-        : { facingMode:{ideal:"environment"}, width:{ideal:want*16/9}, height:{ideal:want}, frameRate:{ideal:30} }
+        ? { deviceId:{exact:devId}, width:{ideal:want*16/9}, height:{ideal:want}, frameRate:wantFps() }
+        : { facingMode:{ideal:"environment"}, width:{ideal:want*16/9}, height:{ideal:want}, frameRate:wantFps() }
     };
-    __phdiag("gum request: " + JSON.stringify(constraints));
-    try{ stream = await navigator.mediaDevices.getUserMedia(constraints);
-      if(stream){ __phdiag("gum ok: " + JSON.stringify((stream.getVideoTracks()[0].getSettings ? stream.getVideoTracks()[0].getSettings() : {}))); } }
+    try{ stream = await askCam(constraints); }
     catch(e){
-      try{ stream = await navigator.mediaDevices.getUserMedia({video:true,audio:false});
-        if(stream) __phdiag("gum fallback ok (bare {video:true})"); }
+      try{ stream = await askCam({video:true,audio:false}); }
       catch(e2){
         const n = e2 && e2.name;
-        __phdiag("gum failed: " + (e && e.name) + " [" + (e && e.message) + "] -> fallback: " + n + " [" + (e2 && e2.message) + "]");
         setStage("camera blocked");
         showMsg(
           n==="NotAllowedError" ? "Camera permission was blocked. Allow it from the address bar, then press Start camera again."
           : n==="NotFoundError" ? "No camera found on this device."
           : n==="NotReadableError" ? "The camera is already in use by another app."
+          : n==="GumTimeoutError" ? "The browser never answered the camera request. Close other apps that might use the camera, allow it in the address bar, then press Start camera again."
           : "Could not open the camera: " + (e2 && e2.message || e2), "bad");
         return;
       }
@@ -3907,11 +3986,11 @@ async function start(){
     v.srcObject = stream;
     try{ await withTimeout(v.play(), 3000); }catch(e){}
     running = true;
-    __phdiag("video playing (running=true)");
     document.body.classList.add("scanning");
     document.body.classList.remove("showcfg");
     $("panelReceive").classList.remove("showcfg");
     grabs=submits=decodesDone=stalled=qrHits=codesSeen=goodScreens=0; diagAt=0; gridAt=0; gridHint=0;
+    liveAt = performance.now();
     capPath = (typeof VideoFrame !== "undefined" && !videoOnly()) ? "track" : "video";
     capSwitches=0; blackStreak=0; blackReported=false; copyToFails=0; copyToBroken=false; grabBusy=false;
     lastFrameTime = -1;
@@ -3919,6 +3998,9 @@ async function start(){
     startedAt = 0; rateWin = [];
     const track = stream.getVideoTracks()[0];
     const st = track && track.getSettings ? track.getSettings() : {};
+    if($("rturbo") && $("rturbo").checked && st.frameRate && st.frameRate < 50)
+      showMsg("Asked the camera for 60 fps but it delivers " + Math.round(st.frameRate)
+            + ". Untick 60 fps or lower the Quality.", "warn");
     v.addEventListener("loadedmetadata", fitReticle);
     fitReticle();
     setStage("camera live");
@@ -3927,6 +4009,7 @@ async function start(){
 
     withTimeout(listCams(), 2500);
     optFocus();
+    antiFlicker(track);
     optWake();
     startDecoder();
   }catch(e){
@@ -3934,7 +4017,6 @@ async function start(){
     showMsg("Could not start: " + (e && e.message || e), "bad");
   }finally{
     starting = false;
-    __phdiag("start() finished" + (stream ? " (stream active)" : " (no stream)"));
   }
 }
 
@@ -3988,10 +4070,15 @@ const WORK = 1024;
 
 
 let diagAt = 0, retAt = 0, gridAt = 0, gridHint = 0;
+let liveAt = 0, lastDropAt = 0, autoDrops = 0;
 let lastProgressAt = 0, lastFramesNew = -1;
 function diagTick(){
   const now = performance.now();
   if(now - retAt > 500){ retAt = now; fitReticle(); }
+  if(running && liveAt && now - liveAt > 25000 && grabs > 0){
+    const delivered = grabs / ((now - liveAt) / 1000);
+    if(delivered < 10) autoQualityDown();
+  }
   if(decoder && !decoder.isComplete){
     /* Detect a transfer that starts and then dies, which is much more useful
        to report than a progress bar that simply stops moving. */
@@ -3999,7 +4086,7 @@ function diagTick(){
       lastFramesNew = decoder.framesNew; lastProgressAt = now;
     } else if(lastProgressAt && now - lastProgressAt > 4000){
       const sec = startedAt ? (performance.now()-startedAt)/1000 : 1;
-      if(grabs/Math.max(1,sec) < 12)
+      if(grabs/Math.max(1,sec) < 12 && !autoQualityDown())
         showMsg("The camera is only delivering about " + (grabs/Math.max(1,sec)).toFixed(0)
               + " frames a second, which caps the speed. Try Quality 720p, or close "
               + "other apps.", "warn");
@@ -4402,118 +4489,5 @@ window.__phosBuild = "2026-08-06.4-auto-render";
   apply(/receive/.test(location.hash) ? "receive" : "send");
 })();
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a270d77b0b81e451',t:'MTc4NjA0ODY2OQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script>
-<script>
-/* PHOS DIAGNOSTICS BUILD — instrumentation only; app logic untouched. */
-(function(){
-  const t0 = performance.now();
-  const lines = [];
-  let el = null, bodyEl = null;
-  function stamp(){ return ((performance.now()-t0)/1000).toFixed(1).padStart(6)+"s"; }
-  function render(){
-    if(!bodyEl) return;
-    bodyEl.textContent = lines.join("\n");
-    bodyEl.scrollTop = bodyEl.scrollHeight;
-  }
-  function build(){
-    el = document.createElement("div");
-    el.id = "phdiag";
-    el.style.cssText = "position:fixed;left:0;right:0;bottom:0;z-index:2147483000;background:rgba(0,0,0,.88);color:#9f9;font:10px/1.35 monospace;max-height:38%;display:flex;flex-direction:column;border-top:1px solid #3c3";
-    const head = document.createElement("div");
-    head.style.cssText = "padding:4px 8px;color:#fff;cursor:pointer;display:flex;gap:8px;align-items:center;user-select:none;-webkit-user-select:none";
-    head.textContent = "PHOS-DIAG v1";
-    const btn = document.createElement("button");
-    btn.textContent = "copy log";
-    btn.style.cssText = "margin-left:auto;font:10px monospace;background:#222;color:#9f9;border:1px solid #3c3;padding:2px 6px";
-    btn.addEventListener("click", function(ev){
-      ev.stopPropagation();
-      const txt = lines.join("\n");
-      function ok(){ btn.textContent = "copied"; }
-      function fallback(){
-        const ta = document.createElement("textarea");
-        ta.value = txt; ta.style.cssText = "position:fixed;top:0;left:0;opacity:0";
-        document.body.appendChild(ta); ta.select();
-        try{ document.execCommand("copy"); ok(); }catch(_){}
-        ta.remove();
-      }
-      try{
-        if(navigator.clipboard && navigator.clipboard.writeText)
-          navigator.clipboard.writeText(txt).then(ok).catch(fallback);
-        else fallback();
-      }catch(_){ fallback(); }
-    });
-    head.appendChild(btn);
-    bodyEl = document.createElement("div");
-    bodyEl.style.cssText = "overflow-y:auto;padding:2px 8px 6px;white-space:pre-wrap;word-break:break-all";
-    head.addEventListener("click", function(){
-      bodyEl.style.display = bodyEl.style.display === "none" ? "" : "none";
-    });
-    el.appendChild(head); el.appendChild(bodyEl);
-    (document.body || document.documentElement).appendChild(el);
-  }
-  window.__phdiag = function(msg){
-    const line = "[" + stamp() + "] " + msg;
-    lines.push(line);
-    try{ console.log("[phdiag] " + msg); }catch(_){}
-    if(lines.length <= 3 || lines.length % 1 === 0) render();
-  };
-  function ready(fn){
-    if(document.readyState !== "loading") fn();
-    else document.addEventListener("DOMContentLoaded", fn);
-  }
-  ready(function(){
-    build(); render();
-    __phdiag("diag build alive");
-    try{
-      const facts = {
-        ua: navigator.userAgent,
-        href: location.href.split("?")[0],
-        secure: window.isSecureContext,
-        mediaDevices: !!navigator.mediaDevices,
-        gum: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
-        decomp: typeof DecompressionStream !== "undefined",
-        videoFrame: typeof VideoFrame !== "undefined",
-        cores: navigator.hardwareConcurrency || 0,
-        memGB: navigator.deviceMemory || "?",
-        dpr: devicePixelRatio,
-        screen: screen.width + "x" + screen.height,
-        vis: document.visibilityState,
-        cfTurnstile: !!window.turnstile,
-        cfChallenge: !!window._cf_chl_opt
-      };
-      __phdiag("env: " + JSON.stringify(facts, null, 0));
-      let cf = [];
-      const sc = document.scripts;
-      for(let i=0;i<sc.length;i++){
-        const s = sc[i].src || "";
-        if(/cdn-cgi|challenges\.cloudflare|turnstile/i.test(s)) cf.push(s.split("/").slice(0,5).join("/"));
-      }
-      __phdiag("scripts: " + sc.length + " tags, cloudflare-injected: " + (cf.length ? JSON.stringify(cf) : "none"));
-      if(navigator.permissions && navigator.permissions.query){
-        navigator.permissions.query({name:"camera"}).then(function(p){
-          __phdiag("permission.camera = " + p.state);
-          p.addEventListener("change", function(){ __phdiag("permission.camera changed -> " + p.state); });
-        }).catch(function(e){ __phdiag("permissions.query failed: " + e); });
-      }
-      const b = document.getElementById("rstart");
-      if(b) b.addEventListener("click", function(){
-        __phdiag("Receive tapped (starting/running state unknown here)");
-      }, true);
-      document.addEventListener("visibilitychange", function(){
-        __phdiag("visibilitychange -> " + document.visibilityState);
-      });
-      window.addEventListener("pagehide", function(){ __phdiag("pagehide"); });
-    }catch(e){ __phdiag("env probe error: " + (e && e.message || e)); }
-  });
-  window.addEventListener("error", function(ev){
-    __phdiag("window.onerror: " + ev.message + " @ " + (ev.filename||"").split("/").pop() + ":" + ev.lineno);
-  }, true);
-  window.addEventListener("unhandledrejection", function(ev){
-    const r = ev.reason;
-    __phdiag("unhandledrejection: " + (r && (r.name + " " + r.message) || r));
-  });
-})();
-</script>
-
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a28accd0deebdc7a',t:'MTc4NjMyMDg2Mg=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a270d77b0b81e451',t:'MTc4NjA0ODY2OQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a28b24ba0aad367e',t:'MTc4NjMyNDQ2Mw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
