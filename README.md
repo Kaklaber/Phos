@@ -1,5 +1,9 @@
 # Phos
 
+<p align="center">
+  <img src="screenshot.png" alt="Phos screenshot" width="900">
+</p>
+
 Send a file between two devices using only a screen and a camera — no network, no pairing, no accounts, no app to install.
 
 **Live page:** https://kaklaber.github.io/Phos/
